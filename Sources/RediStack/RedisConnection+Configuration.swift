@@ -16,6 +16,7 @@ import Atomics
 import NIOCore
 import NIOConcurrencyHelpers
 import NIOPosix
+import NIOSSL
 import Logging
 import struct Foundation.URL
 import protocol Foundation.LocalizedError
@@ -23,6 +24,28 @@ import protocol Foundation.LocalizedError
 extension RedisConnection {
     /// A configuration object for creating a single connection to Redis.
     public struct Configuration: Sendable {
+
+        /// The possible modes of operation for TLS encapsulation of a connection.
+        public struct TLS: Sendable {
+            enum Base {
+                case disable
+                case enable(NIOSSLContext)
+            }
+            let base: Base
+            private init(base: Base) { self.base = base }
+
+            // MARK: Initializers
+
+            /// Do not try to create a TLS connection to the server.
+            public static var disable: Self = .init(base: .disable)
+
+            /// Try to create a TLS connection to the server. If the server supports TLS, create a TLS connection.
+            /// If the server does not support TLS, fail the connection creation.
+            public static func enable(_ sslContext: NIOSSLContext) -> Self {
+                self.init(base: .enable(sslContext))
+            }
+        }
+
         private static let _defaultPortAtomic = ManagedAtomic(6379)
 
         /// The default port that Redis uses.
@@ -42,25 +65,57 @@ extension RedisConnection {
 
         /// The hostname of the connection address. If the address is a Unix socket, then it will be `nil`.
         public var hostname: String? {
-            switch self.address {
-            case let .v4(addr): return addr.host
-            case let .v6(addr): return addr.host
-            case .unixDomainSocket: return nil
-            }
+            self.endpointInfo.hostname
         }
+
         /// The port of the connection address. If the address is a Unix socket, then it will be `nil`.
-        public var port: Int? { self.address.port }
+        public var port: Int? {
+            self.endpointInfo.port
+        }
+
         /// The user name used to authenticate connections with.
         /// - Warning: This property should only be provided if you are running against Redis 6 or higher.
-        public let username: String?
+        public var username: String?
         /// The password used to authenticate the connection.
-        public let password: String?
+        public var password: String?
         /// The initial database index that the connection should use.
-        public let initialDatabase: Int?
+        public var initialDatabase: Int?
         /// The logger prototype that will be used by the connection by default when generating logs.
-        public let defaultLogger: Logger
+        public var defaultLogger: Logger
 
-        internal let address: SocketAddress
+        /// The TLS mode to use for the connection. Valid for all configurations.
+        ///
+        /// See ``TLS-swift.struct``.
+        public var tls: TLS
+
+        internal let endpointInfo: EndpointInfo
+
+        public init(
+            host: String = "localhost",
+            port: Int = 6379,
+            customBootstrap bootstrap: NIOClientTCPBootstrapProtocol? = nil
+        ) {
+            self.init(endpoint: .connectTCP(host: host, port: port, bootstrap: bootstrap))
+        }
+
+        public init(address: SocketAddress) {
+            self.init(endpoint: .resolved(address))
+        }
+
+        public init(establishedChannel channel: Channel) {
+            self.init(endpoint: .configureChannel(channel))
+        }
+
+        private init(endpoint: EndpointInfo) {
+            self.endpointInfo = endpoint
+            self.tls = .disable
+            self.password = nil
+            self.username = nil
+            self.initialDatabase = nil
+            self.defaultLogger = Configuration.defaultLogger
+        }
+
+        // MARK: - Convenience initializers
 
         /// Creates a new connection configuration with the provided details.
         /// - Parameters:
@@ -83,7 +138,7 @@ extension RedisConnection {
                 throw ValidationError.outOfBoundsDatabaseID
             }
 
-            self.address = address
+            self.init(endpoint: .resolved(address))
             self.username = username
             self.password = password
             self.initialDatabase = initialDatabase
@@ -194,6 +249,59 @@ extension RedisConnection {
             )
         }
 
+        // MARK: - Implementation details
+
+        enum EndpointInfo {
+            case configureChannel(Channel)
+            case connectTCP(host: String, port: Int, bootstrap: NIOClientTCPBootstrapProtocol?)
+            case resolved(SocketAddress)
+
+            // TODO: Enable unix domain socket support
+            // case bindUnixDomainSocket(path: String)
+
+            var hostname: String? {
+                switch self {
+                case .configureChannel(let channel):
+                    return channel.remoteAddress?.hostname
+
+                case .connectTCP(let host, _, _):
+                    return host
+
+                case .resolved(let socketAddress):
+                    return socketAddress.hostname
+                }
+            }
+
+            var port: Int? {
+                switch self {
+                case .configureChannel(let channel):
+                    return channel.remoteAddress?.port
+
+                case .connectTCP(_, let port, _):
+                    return port
+
+                case .resolved(let socketAddress):
+                    return socketAddress.port
+                }
+            }
+        }
+
+        init(
+            endpointInfo: EndpointInfo,
+            tls: TLS,
+            username: String,
+            password: String?,
+            database: Int?,
+            logger: Logger
+        ) {
+            self.endpointInfo = endpointInfo
+            self.tls = tls
+            self.username = username
+            self.password = password
+            self.initialDatabase = database
+            self.defaultLogger = logger
+        }
+
         private static func validateRedisURL(_ url: URL) throws {
             guard
                 let scheme = url.scheme,
@@ -242,6 +350,16 @@ extension RedisConnection.Configuration {
                 }()
                 return "(RediStack) \(RedisConnection.Configuration.self) validation failed: \(message)"
             }
+        }
+    }
+}
+
+extension SocketAddress {
+    fileprivate var hostname: String? {
+        switch self {
+        case let .v4(addr): return addr.host
+        case let .v6(addr): return addr.host
+        case .unixDomainSocket: return nil
         }
     }
 }
